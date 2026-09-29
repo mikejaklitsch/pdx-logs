@@ -12,6 +12,8 @@ Commands:
     pdx-logs sweep [...]        analyze all relevant log types in one pass
     pdx-logs grep <PREFIX> [..] pull mod script-log lines (debug_log/error_log)
                                 across debug.log + the error rotation set
+    pdx-logs keys [..]          export unlocalized loc keys and unused/unset
+                                variables, one per line, deduplicated
 
 Exit codes: 0 = clean, 1 = error-severity findings present, 2 = tool failure.
 """
@@ -70,10 +72,11 @@ NORMALIZATION_PATTERNS = [
      "Interaction target key missing", "warning"),
 
     # --- script errors ---
-    ("jomini_effect.cpp:1166", r"Variable '(?P<param>[^']+)' is used but is never set",
-     "Variable used but never set", "error"),
-    ("jomini_effect.cpp:1162", r"Variable '(?P<param>[^']+)' is set but is never used",
-     "Variable set but never used", "error"),
+    # {kind} in a key is filled from the match: Variable, Event target, Flag.
+    ("jomini_effect.cpp:1166", r"(?P<kind>[A-Z][A-Za-z ]*?) '(?P<param>[^']+)' is used but is never set",
+     "{kind} used but never set", "error"),
+    ("jomini_effect.cpp:1162", r"(?P<kind>[A-Z][A-Za-z ]*?) '(?P<param>[^']+)' is set but is never used",
+     "{kind} set but never used", "error"),
     ("jomini_eventtarget.cpp", r"Failed to find a valid event target link '(?P<param>[^']+)' at (?P<loc>\S+)",
      "Invalid event target link", "error"),
     ("jomini_trigger.cpp:806", r"(?P<param>\S+): Inconsistent trigger scopes \((?P<scopes>[^)]+)\) at (?P<loc>\S+)",
@@ -207,6 +210,11 @@ SWEEP_LOGS = ["error", "game", "debug", "gui", "database_conflicts"]
 
 # Max non-timestamped continuation lines attached to an unknown-format message
 MAX_CONTINUATION = 8
+
+# The error_log effect writes through this engine file into error.log. The
+# debug_log effect uses the same file (another line) but writes to debug.log.
+SCRIPT_LOG_SOURCE = "jomini_effect_impl.cpp"
+ERROR_LOG_LINE = "495"
 
 
 # ---------------------------------------------------------------------------
@@ -524,14 +532,16 @@ def parse_files(paths, mod_filter=None, timeout=None, session_secs=None):
 # Normalization
 # ---------------------------------------------------------------------------
 
-_MASK_QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"")
+# A quoted engine type name ("wanted context of type 'Pop'") is kept: it has
+# few values and it names what the message is about.
+_MASK_QUOTED = re.compile(r"(\btype )?('[^']*'|\"[^\"]*\")")
 _MASK_BRACKET = re.compile(r"\[[^\]]*\]")
 _MASK_NUM = re.compile(r"\d+(?:\.\d+)?")
 
 
 def _mask_text(text):
     """Generalize a message so near-identical variants share one group key."""
-    t = _MASK_QUOTED.sub("'…'", text)
+    t = _MASK_QUOTED.sub(lambda m: m.group(0) if m.group(1) else "'…'", text)
     t = _MASK_BRACKET.sub("[…]", t)
     t = _MASK_NUM.sub("#", t)
     return t
@@ -556,6 +566,8 @@ def normalize_messages(messages):
                 continue
             m = pat_re.search(text)
             if m:
+                if "{" in pat_key:
+                    pat_key = pat_key.format(**{k: v for k, v in m.groupdict().items() if v})
                 g = groups[pat_key]
                 g["pattern_key"] = pat_key
                 g["severity"] = severity
@@ -573,10 +585,17 @@ def normalize_messages(messages):
                 break
 
         if not matched:
-            key = f"_uncategorized:{source_file}:{_mask_text(text)[:120]}"
+            if is_error_log(msg):
+                # Mod script called error_log: an error by intent, whatever
+                # the text says. Mod debug prefixes rarely contain "error".
+                key = f"error_log: {_mask_text(text)[:120]}"
+                severity = "error"
+            else:
+                key = f"_uncategorized:{source_file}:{_mask_text(text)[:120]}"
+                severity = _guess_severity(text)
             g = groups[key]
             g["pattern_key"] = key
-            g["severity"] = _guess_severity(text)
+            g["severity"] = severity
             g["source"] = source
             g["instance_count"] += 1
             if len(g["examples"]) < 3:
@@ -586,6 +605,14 @@ def normalize_messages(messages):
                     g["locations"].append(loc)
 
     return dict(groups)
+
+
+def is_error_log(msg):
+    """True for a line that the error_log script effect wrote."""
+    file_part, _, line_part = msg["source"].partition(":")
+    if file_part != SCRIPT_LOG_SOURCE:
+        return False
+    return msg.get("file", "").startswith("error") or line_part == ERROR_LOG_LINE
 
 
 def _guess_severity(text):
@@ -714,7 +741,7 @@ def export_report(f, meta, scored, actionable, suppressed, verbose=False):
 
 def _write_group(f, index, g, verbose):
     badge = SEV_BADGE.get(g["severity"], "INFO")
-    f.write(f"### {index}. [{badge}] {_display_key(g['pattern_key'])} ({g['instance_count']:,} instances)\n\n")
+    f.write(f"### {index}. [{badge}] {_display_key(g['pattern_key'], 120)} ({g['instance_count']:,} instances)\n\n")
     f.write(f"**Source:** `{g['source']}`  \n")
     f.write(f"**Priority:** {g['priority']}\n\n")
 
@@ -765,7 +792,7 @@ def print_plaintext(meta, scored, actionable, suppressed):
 
     for i, g in enumerate(actionable, 1):
         badge = SEV_BADGE.get(g["severity"], "INFO")
-        print(f"  {i}. [{badge}] {_display_key(g['pattern_key'])} ({g['instance_count']:,}x, priority {g['priority']})")
+        print(f"  {i}. [{badge}] {_display_key(g['pattern_key'], 120)} ({g['instance_count']:,}x, priority {g['priority']})")
 
         if g["params"]:
             shown = g["params"][:5]
@@ -865,7 +892,8 @@ def cmd_analyze(argv, cfg):
         description="Paradox (EU5) log analyzer. Stitches rotated logs, scopes "
                     "to the current session, groups errors by pattern.",
         epilog="Exit codes: 0 clean, 1 error-severity findings, 2 tool failure. "
-               "Subcommands: sweep (all log types), grep (mod script-log lines), list.")
+               "Subcommands: sweep (all log types), grep (mod script-log lines), "
+               "keys (name exports), list.")
     parser.add_argument("log", nargs="?", default=None,
                         help="Log name (e.g. 'error'; rotation set auto-included) "
                              "or path. Omit to list available logs.")
@@ -1029,6 +1057,112 @@ def cmd_grep(argv, cfg):
     return 0
 
 
+# Key exports. Each entry: (source file, regex). The regex has a "name" group
+# and, for variables, a "kind" group (Variable, Event target, Flag, ...).
+KEY_SOURCES = {
+    "unlocalized": [
+        ("localization_util.cpp", re.compile(r'^(?P<name>[^\s:]+): "')),
+    ],
+    "unused_vars": [
+        ("jomini_effect.cpp",
+         re.compile(r"(?P<kind>[A-Z][A-Za-z ]*?) '(?P<name>[^']+)' is set but is never used")),
+    ],
+    "unset_vars": [
+        ("jomini_effect.cpp",
+         re.compile(r"(?P<kind>[A-Z][A-Za-z ]*?) '(?P<name>[^']+)' is used but is never set")),
+    ],
+}
+
+
+def collect_keys(messages, wanted):
+    """Return {export: {(kind, name): count}} for the wanted exports."""
+    found = {w: defaultdict(int) for w in wanted}
+    for msg in messages:
+        source_file = msg["source"].split(":")[0]
+        text = msg["raw_message"]
+        for w in wanted:
+            for src, rx in KEY_SOURCES[w]:
+                if source_file != src:
+                    continue
+                m = rx.search(text)
+                if m:
+                    kind = (m.groupdict().get("kind") or "loc key").lower()
+                    found[w][(kind, m.group("name"))] += 1
+    return found
+
+
+def cmd_keys(argv, cfg):
+    parser = argparse.ArgumentParser(
+        prog="pdx-logs keys",
+        description="Export the names behind three error groups as plain lines: "
+                    "unlocalized loc keys (localization fallback), names set but "
+                    "never used, and names used but never set. Reads the whole "
+                    "rotation set and prints each name once. With no selector, "
+                    "prints all three sections.",
+        epilog="Output: one '<export>\t<kind>\t<name>\t<count>' line per name, "
+               "or just the name with --names-only. --json prints one object.")
+    parser.add_argument("--unlocalized", action="store_true",
+                        help="loc keys that fell back to generated text")
+    parser.add_argument("--unused-vars", action="store_true",
+                        help="variables, flags and event targets set but never used")
+    parser.add_argument("--unset-vars", action="store_true",
+                        help="variables, flags and event targets used but never set")
+    parser.add_argument("--logs", default="error",
+                        help="Comma-separated log names to read (default: error)")
+    parser.add_argument("-f", "--filter",
+                        help="Only names that contain this string")
+    parser.add_argument("--names-only", action="store_true",
+                        help="Print only the names, one per line")
+    parser.add_argument("--json", action="store_true", help="Print JSON")
+    parser.add_argument("--all-sessions", action="store_true",
+                        help="Include previous sessions (default: current session only)")
+    args = parser.parse_args(argv)
+
+    wanted = [w for w, on in (("unlocalized", args.unlocalized),
+                              ("unused_vars", args.unused_vars),
+                              ("unset_vars", args.unset_vars)) if on]
+    wanted = wanted or list(KEY_SOURCES)
+
+    logs_dir = resolve_logs_dir(cfg)
+    messages, read_files, skipped_all = [], [], []
+    for name in [n.strip() for n in args.logs.split(",") if n.strip()]:
+        _, paths = resolve_log_set(logs_dir, name)
+        if not paths:
+            print(f"WARNING: no {name} log in {logs_dir}", file=sys.stderr)
+            continue
+        files, skipped, session_secs, _ = _session_scope(logs_dir, paths, args.all_sessions)
+        skipped_all.extend(skipped)
+        read_files.extend(files)
+        msgs, _, _ = parse_files(files, session_secs=session_secs)
+        messages.extend(msgs)
+
+    found = collect_keys(messages, wanted)
+    if args.filter:
+        found = {w: {k: c for k, c in keys.items() if args.filter in k[1]}
+                 for w, keys in found.items()}
+
+    if args.json:
+        print(json.dumps({
+            "files": [str(p) for p in read_files],
+            "exports": {w: [{"kind": k, "name": n, "count": c}
+                            for (k, n), c in sorted(keys.items(), key=lambda kv: kv[0][1])]
+                        for w, keys in found.items()},
+        }, indent=2))
+    else:
+        for w in wanted:
+            for (kind, name), count in sorted(found[w].items(), key=lambda kv: kv[0][1]):
+                print(name if args.names_only else f"{w}\t{kind}\t{name}\t{count}")
+
+    scope = "all sessions" if args.all_sessions else "current session"
+    counts = ", ".join(f"{len(found[w])} {w}" for w in wanted)
+    print(f"\n{counts} ({scope}, {len(read_files)} files: "
+          f"{', '.join(p.name for p in read_files) or '(none)'})", file=sys.stderr)
+    if skipped_all:
+        print(f"Skipped (previous session): {', '.join(p.name for p in skipped_all)}",
+              file=sys.stderr)
+    return 0
+
+
 def cmd_list(cfg):
     logs_dir = resolve_logs_dir(cfg)
     if not logs_dir.is_dir():
@@ -1061,7 +1195,7 @@ def cmd_list(cfg):
             marker = "  (previous session)"
         print(f"  {log.name:<40} {size_str:>10}{marker}")
 
-    print("\nUsage: pdx-logs <log> [-p] | pdx-logs sweep | pdx-logs grep <PREFIX>")
+    print("\nUsage: pdx-logs <log> [-p] | pdx-logs sweep | pdx-logs grep <PREFIX> | pdx-logs keys")
     return 0
 
 
@@ -1077,6 +1211,8 @@ def main():
             return cmd_sweep(argv[1:], cfg)
         if argv and argv[0] == "grep":
             return cmd_grep(argv[1:], cfg)
+        if argv and argv[0] == "keys":
+            return cmd_keys(argv[1:], cfg)
         if argv and argv[0] == "list":
             return cmd_list(cfg)
         return cmd_analyze(argv, cfg)

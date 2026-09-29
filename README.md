@@ -32,7 +32,16 @@ pdx-logs sweep -o report.md       # same, as one combined markdown report
 pdx-logs grep SGD                 # mod script-log lines (debug_log/error_log output) for a prefix
 pdx-logs grep SGD -n 50           # last 50 matches
 pdx-logs grep SGD --logs debug    # search debug.log only
+
+pdx-logs keys                     # unlocalized loc keys, unused and unset names, one per line
+pdx-logs keys --unset-vars        # only names used but never set (variables, flags, event targets)
+pdx-logs keys --unlocalized --names-only   # bare loc keys, ready to paste into a .yml
+pdx-logs keys --json              # the same data as one JSON object
 ```
+
+`keys` reads the whole rotation set and prints each name once, with its kind
+and how many times the log reported it. The error groups in a report show
+only a few sample values; `keys` gives the full list.
 
 Exit codes: 0 clean, 1 error-severity findings present, 2 tool failure. An exit of 1 means the analysis ran fine and found errors, so hooks and CI can gate on it.
 
@@ -42,7 +51,7 @@ Exit codes: 0 clean, 1 error-severity findings present, 2 tool failure. An exit 
 2. **Session scoping.** The most recent game launch is detected from the "Exe Git Version" line in `setup.log`, with the first line of `debug.log` as fallback. Files last written before the launch are skipped whole; within files that span the boundary, messages before the launch timestamp are gated out. `--all-sessions` disables the gate.
 3. **Multi-line parsing.** A state machine accumulates multi-line error blocks before pattern matching. Lines in unknown multi-line formats attach to the preceding message instead of being dropped.
 4. **Normalization.** 58 patterns match parametric error messages and group them by root cause, so a thousand "Missing Icon for Modifier : X" lines become one group with a parameter list. Matching keys on the engine source file name only, not its line number, so engine patches do not degrade categorization. Unmatched messages are generalized by masking numbers, quoted strings, and bracketed values before grouping.
-5. **Scoring.** Groups are ranked by severity and instance count. Errors mentioning your mod prefixes get a boost.
+5. **Scoring.** Groups are ranked by severity and instance count. Errors mentioning your mod prefixes get a boost. A line that mod script wrote with the `error_log` effect is always an error, whatever its text says, and groups under an `error_log:` key. A quoted engine type name, as in "wanted context of type 'Pop'", stays in the group key.
 6. **Noise suppression.** Known engine-level spam is collapsed into its own section.
 
 ## Configuration
